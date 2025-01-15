@@ -1,0 +1,615 @@
+---
+title: "rplc-positive-setaria-everything"
+format: html
+editor: visual
+cache: true
+toc: true
+---
+
+## RPLC Positive setaria everything
+
+```{r,warning=FALSE,echo=FALSE,message=FALSE}
+#lets look at rplc everything 
+library(tidyverse)
+library(collapse)
+library(arrow)
+library(data.table)
+
+input_rplc_positive <- "~/Downloads/DEC17/DOE_dec_9_rplc_positive_voi_AND_adjusted_metadata_w_labels_to_share.csv"
+quantifications_with_metadata = fread(file = input_rplc_positive)
+
+
+doubleGold <- quantifications_with_metadata %>%
+  select(feature_mass, rt,contains("Set"))
+
+
+test <- t(doubleGold)
+
+new_colnames <- paste0("X", test[1,], "_", test[2,])
+
+colnames(test) <- new_colnames
+
+test <- test[-c(1,2),] %>% as.data.frame()
+
+
+
+cols_with_pattern <- colnames(quantifications_with_metadata)[str_detect(colnames(quantifications_with_metadata), "^RPLC_Set_|^Set_")]
+
+extracted_info <- data.frame(
+  original = cols_with_pattern,
+  set_number = str_extract(cols_with_pattern, "(?<=Set_)\\d+"),
+  plate = str_extract(cols_with_pattern, "\\d+(?=_\\d+_H)"),
+  replicate = str_extract(cols_with_pattern, "(?<=_)\\d+(?=_H)"),
+  harvest = str_extract(cols_with_pattern, "H\\d+"),
+  concentration = str_extract(cols_with_pattern, "\\d+(?=_(PH|TB))"),
+  identifier = str_extract(cols_with_pattern, "(PH_\\d+|TB_setaria_\\d+_\\d+)")
+) 
+
+extracted_info.na <- extracted_info %>% 
+  fsubset(is.na(identifier))
+
+extracted_info <- na.omit(extracted_info)
+
+extracted_info.na <- extracted_info.na %>%
+  mutate(
+    # Extract concentration where it's NA by looking for 45_ or 85_ pattern
+    concentration = case_when(
+      is.na(concentration) & str_detect(original, "(45|85)_") ~ 
+        str_extract(original, "(45|85)(?=_)"),
+      TRUE ~ concentration
+    ),
+    
+    # Extract identifier by getting everything after 45_ or 85_
+    identifier = case_when(
+      is.na(identifier) ~ 
+        str_extract(original, "(?<=(45|85)_).*"),
+      TRUE ~ identifier
+    )
+  )
+
+extracted_info.na <- extracted_info.na %>%
+  mutate(identifier=str_replace_all(identifier,"1_1_H1_45_",""))
+
+file1 <- rbind(extracted_info,extracted_info.na)
+test$original <- rownames(test)
+
+rplc.positive.set <- test %>%
+  left_join(file1,by="original") 
+
+rplc.positive.set <- rplc.positive.set %>%
+  select(identifier,concentration,contains("X"))
+
+paste0("Number of features in RPLC+ Setaria:", length(colnames(rplc.positive.set))-2)
+
+
+
+
+```
+
+## presence absence
+
+```{r,warning=FALSE,echo=FALSE,message=FALSE}
+
+
+
+library(tidyverse)
+library(gt)
+
+pa_columns <- rplc.positive.set %>%
+  group_by(identifier) %>%
+  summarize(across(everything(), ~sum(. == 0) >= 2)) %>%
+  select(-identifier) %>%
+  select(where(any)) %>%
+  names()
+
+
+metabolite_cols <- setdiff(names(rplc.positive.set), c("identifier", "concentration"))
+
+non_pa_columns <- setdiff(metabolite_cols, pa_columns)
+
+rplc.positive.set.pa <- rplc.positive.set %>%
+  select(identifier, concentration, all_of(pa_columns))
+
+rplc.positive.set.non_pa <- rplc.positive.set %>%
+  select(identifier, concentration, all_of(non_pa_columns))
+
+cat("Number of PA columns:", length(pa_columns), "\n")
+cat("Number of non-PA columns:", length(non_pa_columns), "\n")
+
+
+# First, let's count zeros in PA columns
+pa_zero_counts <- rplc.positive.set.pa %>%
+  summarize(across(all_of(pa_columns), ~sum(. == 0))) %>%
+  pivot_longer(everything(), 
+               names_to = "metabolite", 
+               values_to = "zero_count") %>%
+  arrange(desc(zero_count))
+
+# Count zeros in non-PA columns
+non_pa_zero_counts <- rplc.positive.set.non_pa %>%
+  summarize(across(all_of(non_pa_columns), ~sum(. == 0))) %>%
+  pivot_longer(everything(), 
+               names_to = "metabolite", 
+               values_to = "zero_count") %>%
+  arrange(desc(zero_count))
+
+
+# Combine PA and non-PA zero counts into one dataframe for comparison
+all_zero_counts <- bind_rows(
+  mutate(pa_zero_counts, type = "PA"),
+  mutate(non_pa_zero_counts, type = "Non-PA")
+)
+
+# Create a boxplot comparing zero counts
+ggplot(all_zero_counts, aes(x = type, y = zero_count)) +
+  geom_boxplot(width = 0.5, fill = "lightblue") +
+  geom_jitter(width = 0.2, alpha = 0.3) +  # Add individual points for better visualization
+  theme_minimal() +
+  labs(title = "Distribution of Zero Counts in PA vs Non-PA Metabolites",
+       x = "Metabolite Type",
+       y = "Number of Zeros") +
+  theme(text = element_text(size = 12))
+
+
+
+```
+
+## remove outliers based on presence absence
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+outliers <- all_zero_counts %>%
+  as.data.frame() %>%
+  filter(type=="PA") %>%
+  fsubset(zero_count>0.95*(dim(file1)[1]))
+
+
+rplc.positive.set <- rplc.positive.set %>% 
+  select(-all_of(outliers$metabolite))
+
+rplc.positive.set.non_pa <- rplc.positive.set.non_pa %>%
+    select(-any_of(outliers$metabolite))
+
+  
+rplc.positive.set.pa <- rplc.positive.set.pa %>%
+    select(-any_of(outliers$metabolite))
+
+```
+
+## removing zero variance
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+# First, let's create a function to identify columns with zero variance
+has_zero_variance <- function(x) {
+    # var() will be 0 if all values are the same
+    # we use na.rm=TRUE to handle any potential NA values
+    var(x, na.rm = TRUE) == 0
+}
+
+# Now let's create the full solution
+# Assuming your dataframe is called 'rplc.positive.set'
+
+# Step 1: Get column names that start with 'X'
+x_columns <- grep("^X", names(rplc.positive.set), value = TRUE)
+
+# Step 2: Among X columns, identify which ones have zero variance
+zero_var_x_cols <- sapply(rplc.positive.set[x_columns], has_zero_variance)
+
+# Step 3: Get names of X columns with zero variance
+cols_to_remove <- x_columns[zero_var_x_cols]
+
+# Step 4: Remove these columns from the dataframe
+rplc.positive.set <- rplc.positive.set[, !names(rplc.positive.set) %in% cols_to_remove]
+
+```
+
+
+## removing outliers by pca
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+pca_result <- prcomp(rplc.positive.set[,-c(1,2)], scale = TRUE)
+
+
+# Load required packages
+library(robustbase)  # For robust statistics
+library(mvoutlier)   # For multivariate outlier detection
+library(DMwR2)       # For Local Outlier Factor
+library(dplyr)
+
+# Function to detect outliers using multiple methods
+detect_pca_outliers <- function(pca_result, data, n_components = 3, md_threshold = 0.975, mad_multiplier = 3.5) {
+  # Extract PC scores for the first n components
+  scores <- as.data.frame(pca_result$x[, 1:n_components])
+  
+  # 1. Mahalanobis Distance
+  md <- mahalonobis_outliers(scores, threshold = md_threshold)
+  
+  # 2. MAD-based detection for each component
+  mad_outliers <- mad_based_outliers(scores, multiplier = mad_multiplier)
+  
+  # 3. Local Outlier Factor
+  lof_scores <- lofactor(scores, k = 5)  # k=5 nearest neighbors
+  lof_outliers <- lof_scores > quantile(lof_scores, 0.975)
+  
+  # Combine results
+  outlier_status <- data.frame(
+    row_id = 1:nrow(scores),
+    mahalanobis_outlier = md,
+    mad_outlier = mad_outliers,
+    lof_outlier = lof_outliers,
+    # Consider a point an outlier if flagged by at least 2 methods
+    consensus_outlier = (md + mad_outliers + lof_outliers) >= 2
+  )
+  
+  return(outlier_status)
+} 
+
+
+
+
+# Helper function for Mahalanobis distance
+mahalonobis_outliers <- function(scores, threshold = 0.975) {
+  center <- colMeans(scores)
+  cov_mat <- cov(scores)
+  md <- mahalanobis(scores, center, cov_mat)
+  # Compare to chi-square distribution
+  cutoff <- qchisq(threshold, df = ncol(scores))
+  return(md > cutoff)
+}
+
+# Helper function for MAD-based detection
+mad_based_outliers <- function(scores, multiplier = 3.5) {
+  # Check if point is outlier in any component
+  outlier_by_comp <- sapply(scores, function(x) {
+    med <- median(x)
+    mad_val <- mad(x)
+    lower <- med - multiplier * mad_val
+    upper <- med + multiplier * mad_val
+    x < lower | x > upper
+  })
+  # Consider point outlier if flagged in at least 2 components
+  return(rowSums(outlier_by_comp) >= 2)
+}
+
+# Usage example:
+# Assuming you have your PCA result and original data:
+outliers <- detect_pca_outliers(pca_result, rplc.positive.set)
+
+# Get indices of consensus outliers
+outlier_indices <- which(outliers$consensus_outlier)
+
+# Create clean dataset without outliers
+clean_data_no_outliers <- clean_data_filtered[-outlier_indices, ]
+
+# Visualize results
+library(ggplot2)
+
+# Function to create PCA plot with outliers highlighted
+plot_pca_outliers <- function(pca_result, outliers, components = c(1, 2)) {
+  scores <- as.data.frame(pca_result$x)
+  scores$outlier <- factor(outliers$consensus_outlier)
+  
+  variance <- summary(pca_result)$importance[2, ] * 100
+  
+  ggplot(scores, aes(x = scores[,components[1]], 
+                     y = scores[,components[2]], 
+                     color = outlier)) +
+    geom_point(alpha = 0.6) +
+    labs(x = sprintf("PC%d (%.1f%%)", components[1], variance[components[1]]),
+         y = sprintf("PC%d (%.1f%%)", components[2], variance[components[2]])) +
+    scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "red")) +
+    theme_minimal() +
+    ggtitle("PCA with Outliers Highlighted")
+}
+
+# Create visualization
+p1 <- plot_pca_outliers(pca_result, outliers, c(1, 2))
+p2 <- plot_pca_outliers(pca_result, outliers, c(1, 3))
+
+p1
+p2
+
+
+```
+
+
+
+## PCA colored by day
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+
+
+
+test <- t(doubleGold)
+
+new_colnames <- paste0("X", test[1,], "_", test[2,])
+
+colnames(test) <- new_colnames
+
+test <- test[-c(1,2),] %>% as.data.frame()
+
+
+
+cols_with_pattern <- colnames(quantifications_with_metadata)[str_detect(colnames(quantifications_with_metadata), "^RPLC_Set_|^Set_")]
+
+extracted_info <- data.frame(
+  original = cols_with_pattern,
+  set_number = str_extract(cols_with_pattern, "(?<=Set_)\\d+"),
+  plate = str_extract(cols_with_pattern, "\\d+(?=_\\d+_H)"),
+  replicate = str_extract(cols_with_pattern, "(?<=_)\\d+(?=_H)"),
+  harvest = str_extract(cols_with_pattern, "H\\d+"),
+  concentration = str_extract(cols_with_pattern, "\\d+(?=_(PH|TB))"),
+  identifier = str_extract(cols_with_pattern, "(PH_\\d+|TB_setaria_\\d+_\\d+)")
+) 
+
+extracted_info.na <- extracted_info %>% 
+  fsubset(is.na(identifier))
+
+extracted_info <- na.omit(extracted_info)
+
+extracted_info.na <- extracted_info.na %>%
+  mutate(
+    # Extract concentration where it's NA by looking for 45_ or 85_ pattern
+    concentration = case_when(
+      is.na(concentration) & str_detect(original, "(45|85)_") ~ 
+        str_extract(original, "(45|85)(?=_)"),
+      TRUE ~ concentration
+    ),
+    
+    # Extract identifier by getting everything after 45_ or 85_
+    identifier = case_when(
+      is.na(identifier) ~ 
+        str_extract(original, "(?<=(45|85)_).*"),
+      TRUE ~ identifier
+    )
+  )
+
+extracted_info.na <- extracted_info.na %>%
+  mutate(identifier=str_replace_all(identifier,"1_1_H1_45_",""))
+
+file1 <- rbind(extracted_info,extracted_info.na)
+test$original <- rownames(test)
+
+rplc.positive.set <- test %>%
+  left_join(file1,by="original") 
+
+rplc.positive.set <- rplc.positive.set %>%
+  select(original,identifier,concentration,harvest,contains("X"))
+
+
+# First, let's keep track of the harvest information before we do the PCA
+data <- rplc.positive.set
+harvest_info <- data$harvest
+
+# Create clean data for PCA
+clean_data <- data %>% select(contains("X")) %>% na.omit()
+
+# Store which rows were kept after na.omit()
+valid_rows <- which(!is.na(rowSums(data %>% select(contains("X")))))
+harvest_info_clean <- harvest_info[valid_rows]
+
+# Perform PCA
+variances <- apply(clean_data, 2, var)
+zero_var_cols <- names(which(variances == 0))
+print("Columns with zero variance:")
+print(zero_var_cols)
+
+# You can also see the unique values in these columns
+for(col in zero_var_cols) {
+  print(paste("Unique values in", col, ":"))
+  print(unique(clean_data[[col]]))
+}
+
+
+# Remove zero-variance columns
+clean_data_filtered <- clean_data[, variances != 0]
+pca_result <- prcomp(clean_data_filtered, scale = TRUE)
+
+# Add small amount of noise to constant columns
+for(col in zero_var_cols) {
+  clean_data[[col]] <- clean_data[[col]] + rnorm(nrow(clean_data), 0, 1e-6)
+}
+pca_result <- prcomp(clean_data, scale = TRUE)
+# Create plot data with harvest information
+plot_data <- as.data.frame(pca_result$x)
+plot_data$harvest <- harvest_info_clean  # Add harvest information to plotting data
+
+plot_data <- plot_data %>%
+  frename(day=harvest)
+
+
+p1 <- ggplot(plot_data %>% na.omit(),
+             aes(x = PC1, y = PC2, color = day,alpha = 0.7)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "%)")
+  )
+
+
+p2 <- ggplot(plot_data %>% na.omit(),
+             aes(x = PC3, y = PC4, color = day,alpha = 0.7)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    x = paste0("PC3 (", round(summary(pca_result)$importance[2,3]*100, 1), "%)"),
+    y = paste0("PC4 (", round(summary(pca_result)$importance[2,4]*100, 1), "%)")
+  )
+
+
+# Create combined plot
+library(cowplot)  
+plot_grid(p1, p2)
+
+
+```
+
+## PCA colored by plate
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+library(stringdist)
+files <- list.files(
+  path = "~/Downloads/INJECTIONS/InjectionListsRPLC",
+  pattern = ".csv",
+  full.names = TRUE
+)
+
+processed_data <- map_df(files, function(file) {
+  # Extract plate name from file path
+  plate_name <- basename(file) %>% 
+    tools::file_path_sans_ext()
+  
+  # Read the file
+  df <- data.table::fread(
+    file,
+    data.table = FALSE,
+    skip = 1
+  )
+  
+  # Find the file name column using pattern matching
+  file_col <- names(df)[grep("^File[_ ]?Name$", names(df), ignore.case = TRUE)]
+  
+  # If we didn't find the column, throw an informative error
+  if (length(file_col) == 0) {
+    stop("Could not find file name column in ", basename(file))
+  }
+  
+  # Process the data using the discovered column name
+  df %>%
+    mutate(plate = plate_name) %>%
+    select(plate, !!sym(file_col)) %>%
+    # Standardize the output column name if desired
+    rename(File_Name = !!sym(file_col)) %>%
+    distinct()
+})
+
+processed_data2 <- processed_data %>%
+  filter(str_detect(File_Name, "Set")) %>%
+  na.omit()
+
+# Assuming your data is in processed_data2
+processed_data2$File_Name <- ifelse(
+  !startsWith(processed_data2$File_Name, "RPLC_"),
+  paste0("RPLC_", processed_data2$File_Name),
+  processed_data2$File_Name
+)
+
+
+
+join3 <- rplc.positive.set %>%
+  rowwise() %>%
+  mutate(
+    matched_file = processed_data2$File_Name[
+      which.min(stringdist(original, processed_data2$File_Name))
+    ]
+  ) %>%
+  left_join(processed_data2, by = c("matched_file" = "File_Name"))
+
+
+join3 <- join3 %>%
+  select(original,matched_file,plate, everything())
+
+
+# First, let's keep track of the harvest information before we do the PCA
+data <- join3
+harvest_info <- data$plate
+
+# Create clean data for PCA
+clean_data <- data %>% select(contains("X")) %>% na.omit()
+
+# Store which rows were kept after na.omit()
+valid_rows <- which(!is.na(rowSums(data %>% select(contains("X")))))
+harvest_info_clean <- harvest_info[valid_rows]
+
+# Perform PCA
+# Find columns with zero/near-zero variance
+variances <- apply(clean_data, 2, var)
+zero_var_cols <- names(which(variances == 0))
+print("Columns with zero variance:")
+print(zero_var_cols)
+
+# You can also see the unique values in these columns
+for(col in zero_var_cols) {
+  print(paste("Unique values in", col, ":"))
+  print(unique(clean_data[[col]]))
+}
+
+
+# Remove zero-variance columns
+clean_data_filtered <- clean_data[, variances != 0]
+pca_result <- prcomp(clean_data_filtered, scale = TRUE)
+
+# Add small amount of noise to constant columns
+for(col in zero_var_cols) {
+  clean_data[[col]] <- clean_data[[col]] + rnorm(nrow(clean_data), 0, 1e-6)
+}
+pca_result <- prcomp(clean_data, scale = TRUE)
+# Create plot data with harvest information
+plot_data <- as.data.frame(pca_result$x)
+plot_data$plate <- harvest_info_clean  # Add harvest information to plotting data
+
+
+
+p1 <- ggplot(plot_data %>% na.omit(),
+             aes(x = PC1, y = PC2, color = plate,alpha = 0.7)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "%)")
+  )
+
+
+
+# Create a custom color palette by combining multiple color generation approaches
+custom_colors <- c(
+  # Start with distinct RGB combinations
+  "#FF0000", "#00FF00", "#0000FF", "#FF00FF", "#00FFFF", "#FFFF00",
+  # Add some darker shades
+  "#800000", "#008000", "#000080", "#800080", "#008080", "#808000",
+  # Add some lighter/pastel shades
+  "#FF8080", "#80FF80", "#8080FF", "#FF80FF", "#80FFFF", "#FFFF80",
+  # Add some mixed tones
+  "#FF8000", "#FF0080", "#80FF00", "#0080FF", "#8000FF", "#00FF80",
+  # Add grays and browns
+  "#404040", "#808080", "#C0C0C0", "#804000", "#004080", "#400080",
+  # Add more variations
+  "#FF4040", "#40FF40", "#4040FF", "#FF4080", "#40FF80", "#4080FF",
+  "#804040", "#408040", "#404080", "#FF6060", "#60FF60"
+)
+
+# Apply the custom palette to your plot
+p1 + 
+  scale_color_manual(values = custom_colors) +
+  # Move legend inside the plot in the upper right empty area
+  theme(legend.position = c(0.85, 0.8),  # Position as percentage of plot width/height
+        legend.background = element_rect(fill = "white", color = "black"),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, "cm")) +  # Make legend more compact
+  guides(color = guide_legend(ncol = 2))  # Split legend into 2 columns for better fit
+
+p2 <- ggplot(plot_data %>% na.omit(),
+             aes(x = PC3, y = PC4, color = plate,alpha = 0.7)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    x = paste0("PC3 (", round(summary(pca_result)$importance[2,3]*100, 1), "%)"),
+    y = paste0("PC4 (", round(summary(pca_result)$importance[2,4]*100, 1), "%)")
+  )
+
+
+p2 + 
+  scale_color_manual(values = custom_colors) +
+  # Move legend inside the plot in the upper right empty area
+  theme(legend.position = c(0.85, 0.8),  # Position as percentage of plot width/height
+        legend.background = element_rect(fill = "white", color = "black"),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, "cm")) +  # Make legend more compact
+  guides(color = guide_legend(ncol = 2)) 
+```
+
+## removing consensus based pca
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+```

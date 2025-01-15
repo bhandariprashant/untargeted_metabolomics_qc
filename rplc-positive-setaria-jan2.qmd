@@ -1,0 +1,564 @@
+---
+title: "rplc-positive-setaria-jan2"
+format: html
+editor: visual
+cache: true
+toc: true
+---
+
+## RPLC Positive setaria everything
+
+```{r,warning=FALSE,echo=FALSE,message=FALSE}
+#lets look at rplc everything 
+library(tidyverse)
+library(collapse)
+library(arrow)
+library(data.table)
+library(cowplot)
+
+input_rplc_positive <- "~/Downloads/DEC17/DOE_dec_9_rplc_positive_voi_AND_adjusted_metadata_w_labels_to_share.csv"
+quantifications_with_metadata = fread(file = input_rplc_positive)
+
+
+doubleGold <- quantifications_with_metadata %>%
+  select(feature_mass, rt,contains("Set"))
+
+
+test <- t(doubleGold)
+
+new_colnames <- paste0("X", test[1,], "_", test[2,])
+
+colnames(test) <- new_colnames
+
+test <- test[-c(1,2),] %>% as.data.frame()
+
+
+
+cols_with_pattern <- colnames(quantifications_with_metadata)[str_detect(colnames(quantifications_with_metadata), "^RPLC_Set_|^Set_")]
+
+extracted_info <- data.frame(
+  original = cols_with_pattern,
+  set_number = str_extract(cols_with_pattern, "(?<=Set_)\\d+"),
+  plate = str_extract(cols_with_pattern, "\\d+(?=_\\d+_H)"),
+  replicate = str_extract(cols_with_pattern, "(?<=_)\\d+(?=_H)"),
+  harvest = str_extract(cols_with_pattern, "H\\d+"),
+  concentration = str_extract(cols_with_pattern, "\\d+(?=_(PH|TB))"),
+  identifier = str_extract(cols_with_pattern, "(PH_\\d+|TB_setaria_\\d+_\\d+)")
+) 
+
+extracted_info.na <- extracted_info %>% 
+  fsubset(is.na(identifier))
+
+extracted_info <- na.omit(extracted_info)
+
+extracted_info.na <- extracted_info.na %>%
+  mutate(
+    # Extract concentration where it's NA by looking for 45_ or 85_ pattern
+    concentration = case_when(
+      is.na(concentration) & str_detect(original, "(45|85)_") ~ 
+        str_extract(original, "(45|85)(?=_)"),
+      TRUE ~ concentration
+    ),
+    
+    # Extract identifier by getting everything after 45_ or 85_
+    identifier = case_when(
+      is.na(identifier) ~ 
+        str_extract(original, "(?<=(45|85)_).*"),
+      TRUE ~ identifier
+    )
+  )
+
+extracted_info.na <- extracted_info.na %>%
+  mutate(identifier=str_replace_all(identifier,"1_1_H1_45_",""))
+
+file1 <- rbind(extracted_info,extracted_info.na)
+test$original <- rownames(test)
+
+rplc.positive.set.raw <- test %>%
+  left_join(file1,by="original") 
+
+rplc.positive.set.raw <- rplc.positive.set.raw %>%
+  mutate(identifier=str_replace_all(identifier,"_RPLC","")) %>%
+  mutate(identifier=str_replace_all(identifier,"setaria", "Setaria"))
+
+
+rplc.positive.set <- rplc.positive.set.raw %>%
+  select(identifier,concentration,contains("X"))
+
+paste0("Number of features in RPLC+ Setaria:", length(colnames(rplc.positive.set))-2)
+
+
+```
+
+## step1: removing outliers with lots of absence
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+# First, let's identify our metabolite columns
+metadata_cols <- c("original", "set_number", "plate", "replicate", "harvest", "concentration", "identifier")
+metabolite_cols <- setdiff(names(rplc.positive.set.raw), metadata_cols)
+
+# Now let's count non-zero values for each feature, grouped by identifier and concentration
+feature_nonzero_counts <- rplc.positive.set.raw %>%
+  group_by(identifier, concentration) %>%
+  # For each metabolite feature, count how many non-zero values we have
+  summarize(across(all_of(metabolite_cols), 
+                   ~as.numeric(sum(. != 0) > 0)), 
+            .groups = 'drop') %>%
+  # Sum up the number of identifier-concentration combinations that have non-zero values
+  summarize(across(all_of(metabolite_cols), sum))
+
+# Get total number of unique identifier-concentration combinations
+total_groups <- n_distinct(rplc.positive.set.raw[c("identifier", "concentration")])
+
+# Convert to percentages and find features to keep (those with more than 5% non-zero values)
+features_to_keep <- feature_nonzero_counts %>%
+  pivot_longer(everything(), 
+               names_to = "feature", 
+               values_to = "nonzero_groups") %>%
+  # Calculate percentage of groups with non-zero values
+  mutate(nonzero_percentage = (nonzero_groups / total_groups) * 100) %>%
+  # Keep features where at least 5% of groups have non-zero values
+  filter(nonzero_percentage >= 5) %>%
+  pull(feature)
+
+# Features to remove are those not in our keep list
+features_to_remove <- setdiff(metabolite_cols, features_to_keep)
+
+# Print summary statistics
+cat("Total metabolite features:", length(metabolite_cols), "\n")
+cat("Total identifier-concentration combinations:", total_groups, "\n")
+cat("Features to keep (≥5% non-zero):", length(features_to_keep), "\n")
+cat("Features to remove (<5% non-zero):", length(features_to_remove), "\n")
+
+# Create filtered dataset
+rplc.positive.set.filtered <- rplc.positive.set.raw %>%
+  select(all_of(c(metadata_cols, features_to_keep)))
+
+```
+
+## step2: removing zero variance
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+# First, let's create a function to identify columns with zero variance
+has_zero_variance <- function(x) {
+    # var() will be 0 if all values are the same
+    # we use na.rm=TRUE to handle any potential NA values
+    var(x, na.rm = TRUE) == 0
+}
+
+# Now let's create the full solution
+# Assuming your dataframe is called 'rplc.positive.set'
+
+# Step 1: Get column names that start with 'X'
+x_columns <- grep("^X", names(rplc.positive.set.filtered), value = TRUE)
+
+# Step 2: Among X columns, identify which ones have zero variance
+zero_var_x_cols <- sapply(rplc.positive.set.filtered[x_columns], has_zero_variance)
+
+# Step 3: Get names of X columns with zero variance
+cols_to_remove <- x_columns[zero_var_x_cols]
+
+# Check if cols_to_remove has any values (is not NULL and has length > 0)
+if (!is.null(cols_to_remove) && length(cols_to_remove) > 0) {
+  # Step 4: Remove these columns from the dataframe
+  rplc.positive.set.filtered <- rplc.positive.set.filtered[, !names(rplc.positive.set) %in% cols_to_remove]
+}
+
+
+metabolite_cols <- grep("^X\\d+", names(rplc.positive.set.filtered), value = TRUE)
+
+# Calculate PCA on scaled metabolite data
+pca_result <- prcomp(rplc.positive.set.filtered[, metabolite_cols], scale. = TRUE)
+
+pca_data <- as.data.frame(pca_result$x)  
+
+# Create PCA plot
+p1.raw <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_point() +
+  theme_minimal()+
+    labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "%)")
+  )
+
+
+p2.raw <- ggplot(pca_data, aes(x = PC3, y = PC4)) +
+  geom_point() +
+  theme_minimal()+
+    labs(
+    x = paste0("PC3 (", round(summary(pca_result)$importance[2,3]*100, 1), "%)"),
+    y = paste0("PC4 (", round(summary(pca_result)$importance[2,4]*100, 1), "%)")
+  )
+
+
+
+```
+
+## step3: removing outlier due to plate
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+library(stringdist)
+files <- list.files(
+  path = "~/Downloads/INJECTIONS/InjectionListsRPLC",
+  pattern = ".csv",
+  full.names = TRUE
+)
+
+processed_data <- map_df(files, function(file) {
+  # Extract plate name from file path
+  plate_name <- basename(file) %>% 
+    tools::file_path_sans_ext()
+  
+  # Read the file
+  df <- data.table::fread(
+    file,
+    data.table = FALSE,
+    skip = 1
+  )
+  
+  # Find the file name column using pattern matching
+  file_col <- names(df)[grep("^File[_ ]?Name$", names(df), ignore.case = TRUE)]
+  
+  # If we didn't find the column, throw an informative error
+  if (length(file_col) == 0) {
+    stop("Could not find file name column in ", basename(file))
+  }
+  
+  # Process the data using the discovered column name
+  df %>%
+    mutate(plate = plate_name) %>%
+    select(plate,Position, !!sym(file_col)) %>%
+    # Standardize the output column name if desired
+    rename(File_Name = !!sym(file_col)) %>%
+    distinct()
+})
+
+processed_data2 <- processed_data %>%
+  filter(str_detect(File_Name, "Set")) %>%
+  na.omit()
+
+# Assuming your data is in processed_data2
+processed_data2$File_Name <- ifelse(
+  !startsWith(processed_data2$File_Name, "RPLC_"),
+  paste0("RPLC_", processed_data2$File_Name),
+  processed_data2$File_Name
+)
+
+
+join3 <- rplc.positive.set.filtered %>%
+  select(original,identifier,concentration,harvest,contains("X"))%>%
+  rowwise() %>%
+  mutate(
+    matched_file = processed_data2$File_Name[
+      which.min(stringdist(original, processed_data2$File_Name))
+    ]
+  ) %>%
+  left_join(processed_data2, by = c("matched_file" = "File_Name"))
+
+
+join3 <- join3 %>%
+  select(original,matched_file,plate,Position, everything())
+
+
+# First, identify metabolite columns (they start with 'X')
+metabolite_cols <- grep("^X\\d+", names(join3), value = TRUE)
+
+# Calculate MAD ratios for each metabolite
+# First, reshape the data to long format - this only happens once
+long_data <- join3 %>%
+  select(plate, all_of(metabolite_cols)) %>%
+  pivot_longer(
+    cols = all_of(metabolite_cols),
+    names_to = "metabolite",
+    values_to = "value"
+  ) %>%
+  group_by(metabolite, plate)
+
+# Now we can calculate all stats at once
+all_plate_stats <- long_data %>%
+  summarize(
+    plate_median = median(value, na.rm = TRUE),
+    plate_mad = mad(value, na.rm = TRUE),
+    .groups = "keep"
+  )
+
+# Calculate final ratios for all metabolites at once
+final_ratios <- all_plate_stats %>%
+  group_by(metabolite) %>%
+  summarize(
+    mad_ratio = mad(plate_median) / median(plate_mad)
+  )
+
+# Convert back to named vector if needed
+mad_ratios <- setNames(final_ratios$mad_ratio, final_ratios$metabolite)
+
+# First ensure injection order is numeric
+join3 <- join3 %>%
+  mutate(injection_number = as.numeric(gsub(".*:(\\d+)$", "\\1", Position)))
+
+# Calculate correlations for each metabolite
+injection_correlations <- join3 %>%
+  group_by(plate) %>%
+  summarize(across(all_of(metabolite_cols), 
+                   ~cor(., injection_number, 
+                        method = "spearman", 
+                        use = "complete.obs")))
+
+# Calculate mean absolute correlation across plates for each metabolite
+mean_abs_correlations <- colMeans(abs(select(injection_correlations, -plate)), 
+                                  na.rm = TRUE)
+
+# Combine results into a summary dataframe
+technical_variation <- data.frame(
+  metabolite = metabolite_cols,
+  mad_ratio = mad_ratios,
+  mean_injection_correlation = mean_abs_correlations
+) %>%
+  arrange(desc(mad_ratio))  # Sort by MAD ratio
+
+# Look at metabolites with high technical variation
+high_variation <- technical_variation %>%
+  filter(mad_ratio >= 3|  # Top 25% of MAD ratios
+           mean_injection_correlation > 0.999)         # Notable injection correlation
+
+high_mad <- technical_variation %>%
+  filter(mad_ratio >= 3)
+
+high_cor <- technical_variation %>%
+ filter(mean_injection_correlation > 0.999)
+
+join4 <- join3 %>%
+  select(-any_of(high_mad$metabolite)) 
+
+
+pdf("~/Desktop/export_yeast_metabolite/rplc-pos-set-mad-ratios.pdf")
+hist(mad_ratios)
+abline(v=3)
+dev.off()
+
+```
+
+## step4: remove strong correlation between injection order and metabolite
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+join5 <- join4 %>%
+  select(-any_of(high_cor$metabolite))
+
+metabolite_cols <- grep("^X\\d+", names(join5), value = TRUE)
+
+# Calculate PCA on scaled metabolite data
+pca_result <- prcomp(join5[, metabolite_cols], scale. = TRUE)
+
+pca_data <- as.data.frame(pca_result$x) %>%
+  bind_cols(join5[, c("plate", "Position")]) 
+
+# Create PCA plot
+p1.afterrplate <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = plate), alpha = 0.6) +
+  theme_minimal()+
+    labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "%)")
+  )
+
+
+p2.afterplate <-ggplot(pca_data, aes(x = PC3, y = PC4)) +
+  geom_point(aes(color = plate), alpha = 0.6) +
+  theme_minimal()+
+    labs(
+    x = paste0("PC3 (", round(summary(pca_result)$importance[2,3]*100, 1), "%)"),
+    y = paste0("PC4 (", round(summary(pca_result)$importance[2,4]*100, 1), "%)")
+  )
+
+
+```
+
+## step5: removing outliers by PCA
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+metabolite_cols <- grep("^X\\d+", names(join5), value = TRUE)
+
+# Calculate PCA on scaled metabolite data
+pca_result <- prcomp(join5[, metabolite_cols], scale. = TRUE)
+
+# Load required packages
+library(robustbase)  # For robust statistics
+library(mvoutlier)   # For multivariate outlier detection
+library(DMwR2)       # For Local Outlier Factor
+library(dplyr)
+
+# Function to detect outliers using multiple methods
+detect_pca_outliers <- function(pca_result, data, n_components = 3, md_threshold = 0.975, mad_multiplier = 3.5) {
+  # Extract PC scores for the first n components
+  scores <- as.data.frame(pca_result$x[, 1:n_components])
+  
+  # 1. Mahalanobis Distance
+  md <- mahalonobis_outliers(scores, threshold = md_threshold)
+  
+  # 2. MAD-based detection for each component
+  mad_outliers <- mad_based_outliers(scores, multiplier = mad_multiplier)
+  
+  # 3. Local Outlier Factor
+  lof_scores <- lofactor(scores, k = 5)  # k=5 nearest neighbors
+  lof_outliers <- lof_scores > quantile(lof_scores, 0.975)
+  
+  # Combine results
+  outlier_status <- data.frame(
+    row_id = 1:nrow(scores),
+    mahalanobis_outlier = md,
+    mad_outlier = mad_outliers,
+    lof_outlier = lof_outliers,
+    # Consider a point an outlier if flagged by at least 2 methods
+    consensus_outlier = (md + mad_outliers + lof_outliers) >= 2
+  )
+  
+  return(outlier_status)
+} 
+
+
+
+
+# Helper function for Mahalanobis distance
+mahalonobis_outliers <- function(scores, threshold = 0.975) {
+  center <- colMeans(scores)
+  cov_mat <- cov(scores)
+  md <- mahalanobis(scores, center, cov_mat)
+  # Compare to chi-square distribution
+  cutoff <- qchisq(threshold, df = ncol(scores))
+  return(md > cutoff)
+}
+
+# Helper function for MAD-based detection
+mad_based_outliers <- function(scores, multiplier = 3.5) {
+  # Check if point is outlier in any component
+  outlier_by_comp <- sapply(scores, function(x) {
+    med <- median(x)
+    mad_val <- mad(x)
+    lower <- med - multiplier * mad_val
+    upper <- med + multiplier * mad_val
+    x < lower | x > upper
+  })
+  # Consider point outlier if flagged in at least 2 components
+  return(rowSums(outlier_by_comp) >= 2)
+}
+
+# Usage example:
+# Assuming you have your PCA result and original data:
+outliers <- detect_pca_outliers(pca_result, rplc.positive.set.filtered)
+
+# Get indices of consensus outliers
+outlier_indices <- which(outliers$consensus_outlier)
+
+# Create clean dataset without outliers
+clean_data_no_outliers <- join5[, metabolite_cols][-outlier_indices, ]
+
+out_file <- join5[, c("identifier", "plate", "concentration", metabolite_cols)][-outlier_indices, ] %>% distinct()
+
+# Visualize results
+library(ggplot2)
+
+# Function to create PCA plot with outliers highlighted
+plot_pca_outliers <- function(pca_result, outliers, components = c(1, 2)) {
+  scores <- as.data.frame(pca_result$x)
+  scores$outlier <- factor(outliers$consensus_outlier)
+  
+  variance <- summary(pca_result)$importance[2, ] * 100
+  
+  ggplot(scores, aes(x = scores[,components[1]], 
+                     y = scores[,components[2]], 
+                     color = outlier)) +
+    geom_point(alpha = 0.6) +
+    labs(x = sprintf("PC%d (%.1f%%)", components[1], variance[components[1]]),
+         y = sprintf("PC%d (%.1f%%)", components[2], variance[components[2]])) +
+    scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "red")) +
+    theme_minimal() +
+    ggtitle("PCA with Outliers Highlighted")
+}
+
+# Create visualization
+p1.outlier <- plot_pca_outliers(pca_result, outliers, c(1, 2))
+p2.outlier <- plot_pca_outliers(pca_result, outliers, c(3, 4))
+
+p1.outlier
+p2.outlier
+
+
+```
+
+## checking if it worked
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+
+
+# First, let's keep track of the harvest information before we do the PCA
+data <- clean_data_no_outliers
+
+# Create clean data for PCA
+clean_data <- data %>% select(contains("X")) %>% na.omit()
+
+pca_result <- prcomp(clean_data, scale = TRUE)
+
+# Create plot data with harvest information
+plot_data <- as.data.frame(pca_result$x)
+
+
+
+p1.post <- ggplot(plot_data %>% na.omit(),
+             aes(x = PC1, y = PC2,alpha = 0.7)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "%)")
+  )
+
+
+p1.post
+
+
+p2.post <- ggplot(plot_data %>% na.omit(),
+             aes(x = PC3, y = PC4,alpha = 0.7)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    x = paste0("PC3 (", round(summary(pca_result)$importance[2,3]*100, 1), "%)"),
+    y = paste0("PC4 (", round(summary(pca_result)$importance[2,4]*100, 1), "%)")
+  )
+
+
+p2.post 
+
+library(cowplot)
+plot_grid(p1.outlier,p2.outlier,p1.post,p2.post)
+
+
+```
+
+## PC journey
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+
+library(cowplot)
+
+plot_grid(p1.raw,p1.afterrplate,
+          p1.outlier,
+          p1.post)
+
+ggsave("~/Desktop/export_yeast_metabolite/set_rplc_pos_pc1_vs_pc2.png",dpi=300,
+       width = 20,height = 10,units = "in")
+
+plot_grid(p2.raw,p2.afterplate,
+          p2.outlier,
+          p2.post)
+
+ggsave("~/Desktop/export_yeast_metabolite/set_rplc_pos_pc3_vs_pc4.png",dpi=300,
+       width = 20,height = 10,units = "in")
+
+
+
+saveRDS(out_file,
+        "~/Desktop/export_yeast_metabolite/clean_data_no_outliers_set_rplc_pos.rds")
+
+
+
+```
